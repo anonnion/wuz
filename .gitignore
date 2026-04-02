@@ -40,3 +40,4 @@ NEW_FEATS.md
 *.code-workspace
 **/*.code-workspace
 .vscode/workspaceStorage/
+*.exe
