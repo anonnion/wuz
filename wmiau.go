@@ -1161,6 +1161,15 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postmap["type"] = "HistorySync"
 		dowebhook = 1
 
+		convCount := 0
+		if evt.Data != nil && evt.Data.Conversations != nil {
+			convCount = len(evt.Data.Conversations)
+		}
+		log.Info().
+			Str("userID", mycli.userID).
+			Int("conversations", convCount).
+			Msg("Received HistorySync event")
+
 		// Save HistorySync messages to message_history table
 		if evt.Data != nil && evt.Data.Conversations != nil {
 			go func() {

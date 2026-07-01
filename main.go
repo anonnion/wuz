@@ -194,6 +194,9 @@ func newSafeHTTPClient() *http.Client {
 }
 
 func isPrivateOrLoopback(ip net.IP) bool {
+	if os.Getenv("WUZAPI_ALLOW_PRIVATE_IP") == "true" {
+		return false
+	}
 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		return true
 	}

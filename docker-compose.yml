@@ -4,9 +4,10 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "${WUZAPI_PORT:-8801}:8801"
+      - "${WUZAPI_PORT:-8080}:${WUZAPI_PORT:-8080}"
     environment:
-      - WUZAPI_ADMIN_TOKEN=${WUZAPI_ADMIN_TOKEN}
+      - WUZAPI_PORT=${WUZAPI_PORT:-8080}
+      - WUZAPI_ADMIN_TOKEN=${WUZAPI_ADMIN_TOKEN:-1234ABCD}
       - WUZAPI_GLOBAL_ENCRYPTION_KEY=${WUZAPI_GLOBAL_ENCRYPTION_KEY}
       - WUZAPI_GLOBAL_HMAC_KEY=${WUZAPI_GLOBAL_HMAC_KEY:-}
       - WUZAPI_GLOBAL_WEBHOOK=${WUZAPI_GLOBAL_WEBHOOK:-}
@@ -18,6 +19,7 @@ services:
       - TZ=${TZ:-America/Sao_Paulo}
       - WEBHOOK_FORMAT=${WEBHOOK_FORMAT:-json}
       - SESSION_DEVICE_NAME=${SESSION_DEVICE_NAME:-WuzAPI}
+      - WUZAPI_ALLOW_PRIVATE_IP=${WUZAPI_ALLOW_PRIVATE_IP:-true}
       # RabbitMQ configuration Optional
       - RABBITMQ_URL=amqp://wuzapi:wuzapi@rabbitmq:5672/
       - RABBITMQ_QUEUE=whatsapp_events
@@ -44,7 +46,7 @@ services:
     networks:
       - wuzapi-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-wuzapi}"]
+      test: [ "CMD-SHELL", "pg_isready -U ${DB_USER:-wuzapi}" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -65,7 +67,7 @@ services:
     networks:
       - wuzapi-network
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      test: [ "CMD", "rabbitmq-diagnostics", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 5
