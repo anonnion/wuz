@@ -3,7 +3,7 @@ let scanned = false;
 let updateAdminTimeout = null;
 let updateUserTimeout = null;
 let updateInterval = 5000;
-let instanceToDelete = null;
+let deletionInProgress = false;
 let isAdminLogin = false;
 let currentInstanceData = null;
 
@@ -17,13 +17,6 @@ document.addEventListener('DOMContentLoaded', function() {
   const adminLoginBtn = document.getElementById('loginAsAdminBtn');
  
   hideWidgets();
-
-  $('#deleteInstanceModal').modal({
-    closable: true,
-    onDeny: function() {
-      instanceToDelete = null;
-    }
-  });
 
   // Initialize dropdowns for webhook events
   $('#webhookEvents').dropdown({
@@ -62,11 +55,14 @@ document.addEventListener('DOMContentLoaded', function() {
       const enabled = $('#proxyEnabled').is(':checked');
       if (enabled) {
         $('#proxyUrlField').addClass('show');
+        $('#proxyWebhookUseProxyField').addClass('show');
       } else {
         $('#proxyUrlField').removeClass('show');
+        $('#proxyWebhookUseProxyField').removeClass('show');
       }
     }
   });
+  $('#proxyWebhookUseProxyToggle').checkbox();
 
   // Initialize add instance proxy toggle
   $('#addInstanceProxyToggle').checkbox({
@@ -74,12 +70,15 @@ document.addEventListener('DOMContentLoaded', function() {
       const enabled = $('input[name="proxy_enabled"]').is(':checked');
       if (enabled) {
         $('#addInstanceProxyUrlField').show();
+        $('#addInstanceProxyWebhookUseProxyField').show();
       } else {
         $('#addInstanceProxyUrlField').hide();
+        $('#addInstanceProxyWebhookUseProxyField').hide();
         $('input[name="proxy_url"]').val('');
       }
     }
   });
+  $('#addInstanceProxyWebhookUseProxyToggle').checkbox();
 
   // Initialize add instance S3 toggle
   $('#addInstanceS3Toggle').checkbox({
@@ -183,31 +182,31 @@ document.addEventListener('DOMContentLoaded', function() {
     return false;
   });
 
-  document.getElementById('pairphoneinput').addEventListener('keypress', function(e) {
-    if (e.key === 'Enter') {
-      const phone = pairPhoneInput.value.trim();
-      if (phone) {
-        connect().then((data) => {
-          if(data.success==true) {
-            pairPhone(phone)
-              .then((data) => {
-                document.getElementById('pairHelp').classList.add('hidden');;
-                // Success case
-                if (data.success && data.data && data.data.LinkingCode) {
-                  document.getElementById('pairInfo').innerHTML = `Your link code is: ${data.data.LinkingCode}`;
-                  scanInterval = setInterval(checkStatus, 1000);
-                } else {
-                  document.getElementById('pairInfo').innerHTML = "Problem getting pairing code";
-                }
-              })
-              .catch((error) => {
-                // Error case
-                document.getElementById('pairInfo').innerHTML = "Problem getting pairing code";
-                console.error('Pairing error:', error);
-              });
-          }
-      });
+  document.getElementById('pairphoneinput').addEventListener('keypress', async function(e) {
+    if (e.key !== 'Enter') return;
+
+    e.preventDefault();
+    const input = e.currentTarget;
+    const phone = input.value.trim();
+    if (!phone || input.disabled) return;
+
+    // This modal is shown only after /session/connect has established the
+    // WhatsApp socket. Calling connect() again here made the pairing flow fail
+    // with "already connected" before /session/pairphone was ever requested.
+    input.disabled = true;
+    try {
+      const data = await pairPhone(phone);
+      document.getElementById('pairHelp').classList.add('hidden');
+      if (data.success && data.data && data.data.LinkingCode) {
+        document.getElementById('pairInfo').textContent = `Your link code is: ${data.data.LinkingCode}`;
+      } else {
+        document.getElementById('pairInfo').textContent = `Problem getting pairing code: ${data.error || 'unknown error'}`;
       }
+    } catch (error) {
+      document.getElementById('pairInfo').textContent = "Problem getting pairing code: request failed";
+      console.error('Pairing error:', error);
+    } finally {
+      input.disabled = false;
     }
   });
 
@@ -224,6 +223,7 @@ document.addEventListener('DOMContentLoaded', function() {
   });
 
   document.getElementById('userInfo').addEventListener('click', function() {
+    resetBusinessProfile();
     document.getElementById('userInfoContainer').innerHTML='';
     document.getElementById("userInfoContainer").classList.add('hidden');
     $('#modalUserInfo').modal({onApprove: function() {
@@ -241,22 +241,37 @@ document.addEventListener('DOMContentLoaded', function() {
     }}).modal('show');
   });
 
+  document.getElementById('messagesendphone').addEventListener('input', updateMentionAllAvailability);
+  document.getElementById('getBusinessProfile').addEventListener('click', doBusinessProfile);
+  document.getElementById('userinfoinput').addEventListener('input', resetBusinessProfile);
+
   document.getElementById('sendTextMessage').addEventListener('click', function() {
-    document.getElementById('sendMessageContainer').innerHTML='';
-    document.getElementById("sendMessageContainer").classList.add('hidden');
+    const container = document.getElementById('sendMessageContainer');
+    container.textContent = '';
+    container.classList.add('hidden');
+    document.getElementById('messageMentionAll').checked = false;
+    updateMentionAllAvailability();
+    let sending = false;
     $('#modalSendTextMessage').modal({onApprove: function() {
-      sendTextMessage().then((result)=>{
-        document.getElementById("sendMessageContainer").classList.remove('hidden');
-        if(result.success===true) {
-           document.getElementById('sendMessageContainer').innerHTML=`Message sent successfully. Id: ${result.data.Id}`
-        } else {
-           document.getElementById('sendMessageContainer').innerHTML=`Problem sending message: ${result.error}`
-        }
+      if (sending) return false;
+      sending = true;
+      const button = document.querySelector('#modalSendTextMessage .positive');
+      button.classList.add('disabled', 'loading');
+      sendTextMessage().then(result => {
+        container.textContent = result.success === true
+          ? `Message sent successfully. Id: ${result.data.Id}`
+          : `Problem sending message: ${result.error || 'Unknown error'}`;
+      }).catch(error => {
+        container.textContent = `Problem sending message: ${error.message}`;
+      }).finally(() => {
+        sending = false;
+        button.classList.remove('disabled', 'loading');
+        container.classList.remove('hidden');
       });
       return false;
     }}).modal('show');
   });
- 
+
   document.getElementById('deleteMessage').addEventListener('click', function() {
     document.getElementById('deleteMessageContainer').innerHTML='';
     document.getElementById("deleteMessageContainer").classList.add('hidden');
@@ -412,6 +427,14 @@ document.addEventListener('DOMContentLoaded', function() {
           prompt: 'History must be a non-negative integer'
         }]
       },
+      days_to_sync_history: {
+        identifier: 'days_to_sync_history',
+        optional: true,
+        rules: [{
+          type: 'integer[0..365]',
+          prompt: 'History sync days must be an integer between 0 and 365'
+        }]
+      },
       proxy_url: {
         identifier: 'proxy_url',
         optional: true,
@@ -495,6 +518,8 @@ document.addEventListener('DOMContentLoaded', function() {
       $('#addInstanceS3Toggle').checkbox('set unchecked');
       $('#addInstanceHmacToggle').checkbox('set unchecked');
       $('#addInstanceProxyUrlField').hide();
+      $('#addInstanceProxyWebhookUseProxyField').hide();
+      $('#addInstanceProxyWebhookUseProxyToggle').checkbox('set checked');
       $('#addInstanceS3Fields').hide();
       $('#addInstanceHmacKeyWarningMessage').hide();
       $('#addInstanceHmacKeyField').hide();
@@ -513,9 +538,11 @@ async function addInstance(data) {
 
   // Build proxy configuration
   const proxyEnabled = data.proxy_enabled === 'on' || data.proxy_enabled === true;
+  const proxyWebhookUseProxy = data.proxy_webhook_use_proxy === 'on' || data.proxy_webhook_use_proxy === true;
   const proxyConfig = {
     enabled: proxyEnabled,
-    proxyURL: proxyEnabled ? (data.proxy_url || '') : ''
+    proxyURL: proxyEnabled ? (data.proxy_url || '') : '',
+    webhookUseProxy: proxyEnabled ? proxyWebhookUseProxy : true
   };
   
   // Build S3 configuration
@@ -545,6 +572,7 @@ async function addInstance(data) {
     webhook: data.webhook_url || '',
     expiration: 0,
     history: parseInt(data.history) || 0,
+    days_to_sync_history: Number(data.days_to_sync_history || 0),
     proxyConfig: proxyConfig,
     s3Config: s3Config,
     hmacKey: hmacKey
@@ -657,6 +685,7 @@ function updateAdmin() {
         populateInstances(result.data)
       } 
     });
+    loadProxyPool();
   } else {
     // get only active instance status
     status().then((result)=> {
@@ -673,8 +702,9 @@ function handleAdminLogin(token,notifications=false) {
   console.log('Admin login with token:', token);
   setLocalStorageItem('admintoken', token, 6);
   setLocalStorageItem('isAdmin', true, 6);
-  $('.adminlogin').show();
   const currentInstance = getLocalStorageItem("currentInstance");
+  // "Go Back" only makes sense while an instance is open, not on the list.
+  $('.adminlogin').toggle(currentInstance != null);
 
   getUsers().then((result) => {
     if(result.success==true) {
@@ -693,6 +723,7 @@ function handleAdminLogin(token,notifications=false) {
       }
       $('#loading').removeClass('active');
       $('.logingrid').addClass('hidden');
+      loadProxyPool();
       updateAdmin();
     } else {
       removeLocalStorageItem('admintoken');
@@ -725,37 +756,73 @@ function showSuccess(message) {
 }
 
 function deleteInstance(id) {
-  instanceToDelete = id;
+  if (deletionInProgress) return;
   $('#deleteInstanceModal').modal({
+    closable: false,
+    onDeny: () => !deletionInProgress,
     onApprove: function() {
-      performDelete(instanceToDelete);
+      performDelete(id);
+      return false;
     }
   }).modal('show');
 }
 
-async function performDelete(id) {
-  console.log('Deleting instance with ID:', id);
-  const admintoken = getLocalStorageItem('admintoken');
-  const myHeaders = new Headers();
-  myHeaders.append('authorization', admintoken);
-  myHeaders.append('Content-Type', 'application/json');
-  res = await fetch(baseUrl + "/admin/users/"+id+"/full", {
-    method: "DELETE",
-    headers: myHeaders
-  });
-  data = await res.json();
-  if(data.success===true) {
-    $('#instance-row-' + id).remove();
-    showDeleteSuccess();
-  } else {
-    showError('Error deleting instance');
+function showPreserveDevicesRecovery(id) {
+  $('#preserveDevicesModal').modal({
+    closable: false,
+    onDeny: () => !deletionInProgress,
+    onApprove: function() {
+      performDelete(id, true);
+      return false;
+    }
+  }).modal('show');
+}
+
+async function performDelete(id, preserveDevices = false) {
+  if (deletionInProgress) return;
+  deletionInProgress = true;
+  const modal = preserveDevices ? '#preserveDevicesModal' : '#deleteInstanceModal';
+  const buttons = $(modal + ' .actions .button');
+  buttons.addClass('disabled');
+  $(modal + ' .positive.button').addClass('loading');
+  let offerRecovery = false;
+  try {
+    const headers = new Headers();
+    headers.append('authorization', getLocalStorageItem('admintoken'));
+    const suffix = preserveDevices ? '/preserve-devices' : '/full';
+    const response = await fetch(baseUrl + '/admin/users/' + encodeURIComponent(id) + suffix, {
+      method: 'DELETE', headers
+    });
+    const data = await response.json();
+    if (response.ok && data.success === true) {
+      $(modal).modal('hide');
+      updateAdmin();
+      showDeleteSuccess(preserveDevices);
+    } else if (!preserveDevices && response.status === 409 && data.error_code === 'ambiguous_device_ownership') {
+      offerRecovery = true;
+    } else {
+      showError(data.error || 'Error deleting instance');
+    }
+  } catch (error) {
+    showError('Could not delete instance. Check your connection and try again.');
+  } finally {
+    deletionInProgress = false;
+    buttons.removeClass('disabled');
+    $(modal + ' .positive.button').removeClass('loading');
+  }
+  if (offerRecovery) {
+    // Open the recovery confirmation only after the first modal has closed.
+    $(modal).modal('setting', 'onHidden', function() {
+      $(modal).modal('setting', 'onHidden', function() {});
+      showPreserveDevicesRecovery(id);
+    }).modal('hide');
   }
 }
 
-function showDeleteSuccess() {
+function showDeleteSuccess(preserveDevices = false) {
   $('body').toast({
     class: 'success',
-    message: 'Instance deleted successfully',
+    message: preserveDevices ? 'Instance deleted; WhatsApp credentials preserved' : 'Instance deleted successfully',
     position: 'top right',
     showProgress: 'bottom'
   });
@@ -786,23 +853,29 @@ function goBackToList() {
   $('.adminlogin').hide();
 }
 
-async function sendTextMessage() {
-  const token = getLocalStorageItem('token');
-  const sendPhone = document.getElementById('messagesendphone').value.trim();
-  const sendBody = document.getElementById('messagesendtext').value;
-  const myHeaders = new Headers();
-  const uuid = generateMessageUUID();
-  myHeaders.append('token', token);
-  myHeaders.append('Content-Type', 'application/json');
-  res = await fetch(baseUrl + "/chat/send/text", {
-    method: "POST",
-    headers: myHeaders,
-    body: JSON.stringify({Phone: sendPhone, Body: sendBody, Id: uuid})
-  });
-  data = await res.json();
-  return data;
+function updateMentionAllAvailability() {
+  const phone = document.getElementById('messagesendphone').value.trim();
+  const checkbox = document.getElementById('messageMentionAll');
+  checkbox.disabled = !/^\d+(?:-\d+)?@g\.us$/.test(phone);
+  if (checkbox.disabled) checkbox.checked = false;
 }
- 
+
+async function sendTextMessage() {
+  const phone = document.getElementById('messagesendphone').value.trim();
+  const body = document.getElementById('messagesendtext').value;
+  const mentionAll = document.getElementById('messageMentionAll').checked;
+  if (!phone || !body.trim()) throw new Error('Enter a recipient and message.');
+  if (mentionAll && !/^\d+(?:-\d+)?@g\.us$/.test(phone)) {
+    throw new Error('Mention-all requires a group JID ending in @g.us.');
+  }
+  const response = await fetch(baseUrl + '/chat/send/text', {
+    method: 'POST',
+    headers: {token: getLocalStorageItem('token'), 'Content-Type': 'application/json'},
+    body: JSON.stringify({Phone: phone, Body: body, Id: generateMessageUUID(), MentionAll: mentionAll})
+  });
+  return response.json();
+}
+
 async function deleteMessage() {
   const deletePhone = document.getElementById('messagedeletephone').value.trim();
   const deleteId = document.getElementById('messagedeleteid').value;
@@ -843,7 +916,7 @@ function doUserAvatar() {
   let phone = userAvatarInput.value.trim();
   if (phone) {
     if (!phone.endsWith('@s.whatsapp.net')) {
-      phone = phone.includes('@') ? phone.split('@')[0] + '@s.whatsapp.net' : phone + '@s.whatsapp.net';
+      phone = phone.includes('@') ? phone : phone + '@s.whatsapp.net';
     }
     userAvatar(phone).then((data) => {
       document.getElementById("userAvatarContainer").classList.remove('hidden');
@@ -865,7 +938,7 @@ function doUserInfo() {
   let phone = userInfoInput.value.trim();
   if (phone) {
     if (!phone.endsWith('@s.whatsapp.net')) {
-      phone = phone.includes('@') ? phone.split('@')[0] + '@s.whatsapp.net' : phone + '@s.whatsapp.net';
+      phone = phone.includes('@') ? phone : phone + '@s.whatsapp.net';
     }
     userInfo(phone).then((data) => {
       document.getElementById("userInfoContainer").classList.remove('hidden');
@@ -1057,12 +1130,12 @@ async function pairPhone(phone) {
   const myHeaders = new Headers();
   myHeaders.append('token', token);
   myHeaders.append('Content-Type', 'application/json');
-  res = await fetch(baseUrl + "/session/pairphone", {
+  const res = await fetch(baseUrl + "/session/pairphone", {
     method: "POST",
     headers: myHeaders,
     body: JSON.stringify({Phone: phone})
   });
-  data = await res.json();
+  const data = await res.json();
   return data;
 }
 
@@ -1157,7 +1230,6 @@ function init() {
 
   // Starting
   let notoken=0;
-  let scanInterval;
   let token = getLocalStorageItem('token');
   let admintoken = getLocalStorageItem('admintoken');
   let isAdminLogin = getLocalStorageItem('isAdmin');
@@ -1175,6 +1247,192 @@ function init() {
   }
 }
 
+// ===== Passkey functions =====
+let currentPasskeyPublicKey = null;
+let passkeyPollInterval = null;
+let passkeyPollTimeout = null;
+
+/**
+ * Clear any active passkey polling interval and timeout.
+ * Call this when modal closes, connection succeeds, or navigating away.
+ */
+function clearPasskeyPolling() {
+  if (passkeyPollInterval) { clearInterval(passkeyPollInterval); passkeyPollInterval = null; }
+  if (passkeyPollTimeout) { clearTimeout(passkeyPollTimeout); passkeyPollTimeout = null; }
+}
+
+function formatPasskeyCode(publicKey) {
+  const pkStr = JSON.stringify(publicKey, null, 2);
+  return `const publicKey = ${pkStr};\n\n(async () => {\n  const credential = await navigator.credentials.get({\n    publicKey: PublicKeyCredential.parseRequestOptionsFromJSON(publicKey)\n  });\n  console.log(JSON.stringify(credential.toJSON()));\n})();`;
+}
+
+function copyPasskeyCode() {
+  const code = document.getElementById('passkeyCodeBlock').textContent;
+  navigator.clipboard.writeText(code).then(() => {
+    $.toast({ class: 'success', message: 'Code copied to clipboard!' });
+  }).catch(() => {
+    const textarea = document.createElement('textarea');
+    textarea.value = code;
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand('copy');
+    document.body.removeChild(textarea);
+    $.toast({ class: 'success', message: 'Code copied to clipboard!' });
+  });
+}
+
+function showPasskeyModal(publicKey) {
+  currentPasskeyPublicKey = publicKey;
+  const code = formatPasskeyCode(publicKey);
+  document.getElementById('passkeyCodeBlock').textContent = code;
+  document.getElementById('passkeyResponseInput').value = '';
+  $('#modalPasskeyPairing')
+    .modal({
+      closable: true,
+      onHidden: function() { clearPasskeyPolling(); }
+    })
+    .modal('show');
+}
+
+async function submitPasskeyResponse() {
+  const input = document.getElementById('passkeyResponseInput').value.trim();
+  if (!input) {
+    $.toast({ class: 'error', message: 'Paste the console result before sending.' });
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(input);
+  } catch (e) {
+    $.toast({ class: 'error', message: 'Invalid JSON. Check the format and try again.' });
+    return;
+  }
+
+  const btn = document.getElementById('sendPasskeyBtn');
+  btn.classList.add('loading');
+
+  const token = getLocalStorageItem('token');
+  const myHeaders = new Headers();
+  myHeaders.append('token', token);
+  myHeaders.append('Content-Type', 'application/json');
+
+  try {
+    const res = await fetch(baseUrl + "/session/passkey-response", {
+      method: "POST",
+      headers: myHeaders,
+      body: JSON.stringify({ response: parsed })
+    });
+    const data = await res.json();
+    const errorDetail = data.errors?.error || data.error;
+
+    if (!res.ok || !data.success) {
+      $.toast({ class: 'error', message: 'Error sending passkey: ' + (errorDetail || 'Unknown error') });
+      btn.classList.remove('loading');
+      return;
+    }
+
+    const status = data.data?.status || data.status;
+
+    if (status === 'passkey_finished') {
+      $.toast({ class: 'success', message: 'Channel connected successfully!' });
+      $('#modalPasskeyPairing').modal('hide');
+      updateInterval = 5000;
+      btn.classList.remove('loading');
+      return;
+    }
+
+    if (status === 'passkey_response_sent') {
+      $.toast({ class: 'info', message: 'Response sent! Awaiting WhatsApp confirmation...' });
+
+      // Now call passkey-confirm to trigger the pairing code display
+      const confirmRes = await fetch(baseUrl + "/session/passkey-confirm", {
+        method: "POST",
+        headers: myHeaders,
+        body: JSON.stringify({})
+      });
+      const confirmData = await confirmRes.json();
+      const confirmError = confirmData.errors?.error || confirmData.error;
+
+      if (!confirmRes.ok || !confirmData.success) {
+        $.toast({ class: 'error', message: 'Error confirming: ' + (confirmError || 'Unknown') });
+        btn.classList.remove('loading');
+        return;
+      }
+
+      const confirmStatus = confirmData.data?.status || confirmData.status;
+
+      if (confirmStatus === 'passkey_finished') {
+        // Connected immediately (SkipHandoffUX was true)
+        $.toast({ class: 'success', message: 'Channel connected successfully!' });
+        $('#modalPasskeyPairing').modal('hide');
+        updateInterval = 5000;
+      } else if (confirmStatus === 'passkey_confirmed') {
+        // Confirmation sent — now wait for status to change via polling
+        $.toast({ class: 'success', message: 'Passkey confirmed! Waiting for connection...' });
+        document.getElementById('passkeyCodeBlock').textContent = 'Waiting for connection...';
+        document.getElementById('passkeyResponseInput').value = '';
+        document.getElementById('passkeyResponseInput').placeholder = 'Waiting for WhatsApp to confirm...';
+
+        // Start polling — the modal stays open until loggedIn becomes true
+        startPasskeyPolling(token);
+      } else {
+        $.toast({ class: 'success', message: 'Passkey confirmed. Waiting for connection...' });
+        $('#modalPasskeyPairing').modal('hide');
+      }
+    } else {
+      $.toast({ class: 'success', message: 'Passkey response sent.' });
+      $('#modalPasskeyPairing').modal('hide');
+    }
+  } catch (err) {
+    $.toast({ class: 'error', message: 'Network error: ' + err.message });
+  }
+
+  btn.classList.remove('loading');
+}
+
+function startPasskeyPolling(token) {
+  // Clear any existing polling before starting a new one
+  clearPasskeyPolling();
+
+  passkeyPollInterval = setInterval(async () => {
+    try {
+      const myHeaders = new Headers();
+      myHeaders.append('token', token);
+      const res = await fetch(baseUrl + "/session/status", {
+        method: "GET",
+        headers: myHeaders,
+      });
+      const data = await res.json();
+
+      if (data.success && data.data) {
+        if (data.data.loggedIn) {
+          // Connected!
+          clearPasskeyPolling();
+          $.toast({ class: 'success', message: 'Channel connected successfully!' });
+          $('#modalPasskeyPairing').modal('hide');
+          updateInterval = 5000;
+        } else if (!data.data.passkeyPending) {
+          // Passkey was consumed but not yet logged in — keep polling briefly
+        } else {
+          // Still waiting
+        }
+      }
+    } catch (e) {
+      // Silently continue polling on network errors
+    }
+  }, 2000);
+
+  // Safety: stop polling after 60 seconds
+  passkeyPollTimeout = setTimeout(() => {
+    clearPasskeyPolling();
+    const modalVisible = $('#modalPasskeyPairing').modal('is active');
+    if (modalVisible) {
+      $.toast({ class: 'warning', message: 'Passkey polling timed out. Check connection status.' });
+    }
+  }, 60000);
+}
+
 function populateInstances(instances) {
   const tableBody = $('#instances-body');
   const cardsContainer = $('#instances-cards'); // Assuming you have a container for cards
@@ -1183,10 +1441,10 @@ function populateInstances(instances) {
   const currentInstance = getLocalStorageItem('currentInstance');
 
   if(instances.length==0) {
-    const nodatarow = '<tr><td style="text-align:center;" colspan=5>No instances found</td></tr>'
+    const nodatarow = '<tr><td style="text-align:center;" colspan=6>No instances found</td></tr>'
     tableBody.append(nodatarow);
   }
-  instances.forEach(instance => {
+  instances.forEach((instance, idx) => {
 
   const row = `
       <tr>
@@ -1194,6 +1452,7 @@ function populateInstances(instances) {
         <td>${instance.name}</td>
         <td><i class="${instance.connected ? 'check green' : 'times red'} icon"></i> <span class="status ${instance.connected}">${instance.connected ? 'Yes' : 'No'}</span></td>
         <td><i class="${instance.loggedIn ? 'check green' : 'times red'} icon"></i> <span class="status ${instance.loggedIn}">${instance.loggedIn ? 'Yes' : 'No'}</span></td>
+        <td>${instanceProxyLabel(instance)}</td>
         <td>
           <button class="ui primary button dashboard-button" onclick="openDashboard('${instance.id}', '${instance.token}')">
             <i class="external alternate icon"></i> Open
@@ -1261,6 +1520,18 @@ function populateInstances(instances) {
                               <div class="header">Proxy URL</div>
                               <div class="content">${instance.proxy_config.proxy_url || 'Not configured'}</div>
                           </div>
+                          ${instance.proxy_pool_id ? `
+                          <div class="item">
+                              <div class="header">Proxy Pool</div>
+                              <div class="content">
+                                  ${instanceProxyLabel(instance)}
+                                  ${getLocalStorageItem('isAdmin') && !instance.connected ? `<button class="ui mini orange button" onclick="releaseProxyPool('${instance.id}')" title="Free this pool slot; a pool proxy is assigned again on the next connect">Release</button>` : ''}
+                              </div>
+                          </div>` : ''}
+                          <div class="item">
+                              <div class="header">Webhook Proxy</div>
+                              <div class="content">${instance.proxy_config.webhook_use_proxy === false ? 'Bypass proxy' : 'Use proxy'}</div>
+                          </div>
                           <div class="item">
                               <div class="header">S3</div>
                               <div class="content">${instance.s3_config.enabled ? 'Enabled' : 'Disabled'}</div>
@@ -1272,9 +1543,23 @@ function populateInstances(instances) {
                       </div>
                   </div>
                   
-                  <!-- Right Column - QR Code (only shown if not logged in) -->
+                  <!-- Right Column - QR Code / Passkey (only shown if not logged in) -->
                   ${!instance.loggedIn ? `
                   <div class="column" style="display: flex; flex-direction: column; justify-content: center; align-items: center;">
+                      ${instance.passkeyPending && instance.publicKey ? `
+                      <!-- Passkey Mode -->
+                      <div class="ui segment" style="width: 100%; max-width: 300px; text-align: center;">
+                        <i class="key icon" style="font-size: 3em; color: #f2711c;"></i>
+                        <h4 class="ui header">Passkey Required</h4>
+                        <p style="font-size: 12px; color: #666;">
+                          WhatsApp requested passkey verification.
+                        </p>
+                        <button class="ui orange button passkey-setup-btn" data-passkey-index="${idx}">
+                          <i class="key icon"></i> Setup Passkey
+                        </button>
+                      </div>
+                      ` : `
+                      <!-- QR Code Mode -->
                       <div class="ui segment" style="width: 100%; max-width: 200px; height: 200px; display: flex; justify-content: center; align-items: center;">
                         ${instance.qrcode ? 
                           `<img src="${instance.qrcode}" style="max-height: 100%; max-width: 100%;">
@@ -1288,6 +1573,7 @@ function populateInstances(instances) {
                                 </div>`
                            }
                       </div>
+                      `}
                     </div>
                     ` : `
                     <!--one column when no qr to display-->
@@ -1298,7 +1584,7 @@ function populateInstances(instances) {
             <div class="extra content">
               <button class="ui primary positive button dashboard-button ${instance.connected === true ? 'hidden' : ''}" id="button-connect-${instance.id}" onclick="connect('${instance.token}')">Connect</button>
               <button class="ui primary negative button dashboard-button ${instance.connected === true ? '' : 'hidden'}" id="button-logout-${instance.id}" onclick="logout('${instance.token}')">Logout</button>
-              <button class="ui primary positive button dashboard-button ${instance.connected === true && instance.loggedIn === false ? '' : 'hidden'} id="button-logout-${instance.id}" onclick="modalPairPhone()">Login with Pairing Code</button>
+              <button class="ui primary positive button dashboard-button ${instance.connected === true && instance.loggedIn === false ? '' : 'hidden'}" id="button-pair-${instance.id}" onclick="modalPairPhone()">Login with Pairing Code</button>
               </div>
         </div>
         `;
@@ -1313,7 +1599,16 @@ function populateInstances(instances) {
      if (currentInstanceObj) {
        currentInstanceData = currentInstanceObj;
      }
-  } 
+  }
+
+  // Bind passkey setup buttons
+  document.querySelectorAll('.passkey-setup-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      const idx = parseInt(this.getAttribute('data-passkey-index'), 10);
+      const pk = instances[idx] && instances[idx].publicKey;
+      if (pk) showPasskeyModal(pk);
+    });
+  });
 }
 
 /**
@@ -1618,6 +1913,7 @@ async function loadHistoryConfig() {
     
     if (res.ok) {
       const data = await res.json();
+      $('#historySyncDays').val(data.data?.days_to_sync_history ?? 0);
       if (data.code === 200 && data.data && data.data.history) {
         const historyConfig = data.data.history;
         $('#history').val(historyConfig);
@@ -1637,10 +1933,17 @@ async function saveHistoryConfig() {
   myHeaders.append('token', token);
   myHeaders.append('Content-Type', 'application/json');
   
-  const historyConfig = parseInt($('#history').val());
+  const historyConfig = Number($('#history').val());
+  const syncDays = Number($('#historySyncDays').val());
+  if (!Number.isInteger(historyConfig) || historyConfig < 0 ||
+      !Number.isInteger(syncDays) || syncDays < 0 || syncDays > 365) {
+    showError('History must be a non-negative integer and sync days must be between 0 and 365.');
+    return;
+  }
   
   const config = {
     history: historyConfig,
+    days_to_sync_history: syncDays,
   };
   
   try {
@@ -1652,7 +1955,7 @@ async function saveHistoryConfig() {
     
     const data = await res.json();
     if (data.success) {
-      showSuccess('History configuration saved successfully');
+      showSuccess('History configuration saved. Sync days apply on the next pairing.');
       $('#modalHistoryConfig').modal('hide');
     } else {
       showError('Failed to save history configuration: ' + (data.error || 'Unknown error'));
@@ -1682,6 +1985,7 @@ async function loadProxyConfig() {
         const proxyConfig = data.data.proxy_config;
         const proxyUrl = proxyConfig.proxy_url || '';
         const enabled = proxyConfig.enabled || false;
+        const webhookUseProxy = proxyConfig.webhook_use_proxy !== false;
         
         // Set checkbox state
         $('#proxyEnabled').prop('checked', enabled);
@@ -1689,12 +1993,17 @@ async function loadProxyConfig() {
         
         // Set proxy URL
         $('#proxyUrl').val(proxyUrl);
+
+        $('#proxyWebhookUseProxy').prop('checked', webhookUseProxy);
+        $('#proxyWebhookUseProxyToggle').checkbox(webhookUseProxy ? 'set checked' : 'set unchecked');
         
         // Show/hide URL field based on enabled state
         if (enabled) {
           $('#proxyUrlField').addClass('show');
+          $('#proxyWebhookUseProxyField').addClass('show');
         } else {
           $('#proxyUrlField').removeClass('show');
+          $('#proxyWebhookUseProxyField').removeClass('show');
         }
       } else {
         // No proxy config, set defaults
@@ -1702,6 +2011,9 @@ async function loadProxyConfig() {
         $('#proxyEnabledToggle').checkbox('set unchecked');
         $('#proxyUrl').val('');
         $('#proxyUrlField').removeClass('show');
+        $('#proxyWebhookUseProxy').prop('checked', true);
+        $('#proxyWebhookUseProxyToggle').checkbox('set checked');
+        $('#proxyWebhookUseProxyField').removeClass('show');
       }
     }
   } catch (error) {
@@ -1717,12 +2029,14 @@ async function saveProxyConfig() {
   
   const enabled = $('#proxyEnabled').is(':checked');
   const proxyUrl = $('#proxyUrl').val().trim();
+  const webhookUseProxy = $('#proxyWebhookUseProxy').is(':checked');
   
   // If proxy is disabled, send disable request
   if (!enabled) {
     const config = {
       enable: false,
-      proxy_url: ''
+      proxy_url: '',
+      webhook_use_proxy: webhookUseProxy
     };
     
     try {
@@ -1760,7 +2074,8 @@ async function saveProxyConfig() {
   
   const config = {
     enable: true,
-    proxy_url: proxyUrl
+    proxy_url: proxyUrl,
+    webhook_use_proxy: webhookUseProxy
   };
   
   try {
@@ -1882,7 +2197,7 @@ async function deleteHmacConfig() {
     
     const response = await res.json();
     
-    // Nova verificação - estrutura direta sem "success"
+    // This endpoint returns Details directly, without a success wrapper.
     if (res.ok && response.Details) {
       showSuccess('HMAC configuration deleted successfully');
       
@@ -1952,5 +2267,81 @@ function toggleHmacKeyVisibilityInstance() {
     input.attr('type', 'password');
     showBtn.show();
     hideBtn.hide();
+  }
+}
+
+// Invalidate previous results when the account changes or the modal reopens.
+let businessProfileRequest = 0;
+function resetBusinessProfile() {
+  businessProfileRequest++;
+  const container = document.getElementById('businessProfileContainer');
+  container.textContent = '';
+  container.classList.add('hidden');
+  const button = document.getElementById('getBusinessProfile');
+  button.disabled = false;
+  button.classList.remove('loading');
+}
+
+function appendProfileField(container, label, value) {
+  const row = document.createElement('div');
+  const title = document.createElement('strong');
+  title.textContent = label + ': ';
+  row.appendChild(title);
+  row.appendChild(document.createTextNode(value || 'Not provided'));
+  container.appendChild(row);
+}
+
+function renderBusinessProfile(container, profile) {
+  container.textContent = '';
+  appendProfileField(container, 'Account', profile.JID);
+  appendProfileField(container, 'Address', profile.Address);
+  appendProfileField(container, 'Email', profile.Email);
+  appendProfileField(container, 'Business hours timezone', profile.BusinessHoursTimeZone);
+  for (const [label, value] of [['Categories', profile.Categories], ['Profile details', profile.ProfileOptions], ['Business hours', profile.BusinessHours]]) {
+    const details = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent = label;
+    const pre = document.createElement('pre');
+    pre.style.whiteSpace = 'pre-wrap';
+    pre.textContent = JSON.stringify(value || (label === 'Profile details' ? {} : []), null, 2);
+    details.appendChild(summary);
+    details.appendChild(pre);
+    container.appendChild(details);
+  }
+}
+
+async function doBusinessProfile() {
+  const phone = document.getElementById('userinfoinput').value.trim();
+  const container = document.getElementById('businessProfileContainer');
+  const button = document.getElementById('getBusinessProfile');
+  const request = ++businessProfileRequest;
+  container.classList.remove('hidden');
+  if (!/^\+?\d+(?:@(s\.whatsapp\.net|lid))?$/.test(phone)) {
+    container.textContent = 'Enter an international phone number or individual PN/LID JID.';
+    return;
+  }
+  button.disabled = true;
+  button.classList.add('loading');
+  container.textContent = 'Looking up business profile…';
+  try {
+    const response = await fetch(baseUrl + '/user/business-profile', {
+      method: 'POST',
+      headers: {token: getLocalStorageItem('token'), 'Content-Type': 'application/json'},
+      body: JSON.stringify({Phone: phone})
+    });
+    const result = await response.json();
+    if (request !== businessProfileRequest) return;
+    if (!response.ok || !result.success || !result.data) {
+      container.textContent = `Business profile unavailable: ${result.error || 'No profile returned'}`;
+      return;
+    }
+    renderBusinessProfile(container, result.data);
+  } catch (error) {
+    if (request === businessProfileRequest) container.textContent = 'Unable to fetch business profile. Please try again.';
+  } finally {
+    if (request === businessProfileRequest) {
+      button.disabled = false;
+      button.classList.remove('loading');
+    }
   }
 }
