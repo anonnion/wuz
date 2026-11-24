@@ -20,11 +20,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"regexp"
 	"runtime/debug"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	"time"
 
@@ -39,7 +40,6 @@ import (
 	"github.com/jmoiron/sqlx"
 	"github.com/nfnt/resize"
 	"github.com/rs/zerolog/log"
-	"github.com/vincent-petithory/dataurl"
 )
 
 const (
@@ -50,8 +50,9 @@ const (
 	fetchDocumentMaxBytes    = 100 * 1024 * 1024 // 100MB
 	openGraphPageMaxBytes    = 2 * 1024 * 1024   // 2MB
 	openGraphImageMaxBytes   = 10 * 1024 * 1024  // 10MB
-	openGraphThumbnailWidth  = 100
-	openGraphThumbnailHeight = 100
+	openGraphThumbnailWidth  = 192
+	openGraphThumbnailHeight = 192
+	openGraphHQThumbnailDim  = 600 // Max dimension of the uploaded thumbnail used for the large preview card
 	openGraphJpegQuality     = 80
 	openGraphMaxImageDim     = 4000 // Max width or height for Open Graph images
 	openGraphUserFetchLimit  = 20   // Limit concurrent Open Graph fetches per user
@@ -90,10 +91,36 @@ type WebhookErrorPayload struct {
 	AttemptTime      time.Time              `json:"attemptTime"`
 	ErrorMessage     string                 `json:"errorMessage"`
 }
+
+// ProxyConfig holds per-user proxy settings for WhatsApp and webhook delivery.
+type ProxyConfig struct {
+	Enabled         bool   `json:"enabled"`
+	ProxyURL        string `json:"proxyURL"`
+	WebhookUseProxy *bool  `json:"webhookUseProxy,omitempty"`
+}
+
+func resolveWebhookUseProxy(perUser *bool) bool {
+	if perUser != nil {
+		return *perUser
+	}
+	return *globalWebhookUseProxy
+}
+
+func proxyConfigResponse(proxyURL string, webhookUseProxy bool) map[string]interface{} {
+	return map[string]interface{}{
+		"enabled":           proxyURL != "",
+		"proxy_url":         proxyURL,
+		"webhook_use_proxy": webhookUseProxy,
+	}
+}
+
 type openGraphResult struct {
 	Title       string
 	Description string
-	ImageData   []byte
+	ImageData   []byte // small inline thumbnail (JPEGThumbnail field)
+	HQImageData []byte // larger thumbnail uploaded to WA media servers for the big preview card
+	HQWidth     uint32
+	HQHeight    uint32
 }
 
 type UserSemaphoreManager struct {
@@ -121,6 +148,81 @@ var (
 
 )
 
+// mentionRegex locates candidates; boundaries below exclude email addresses,
+// URL paths, and numeric prefixes of longer tokens.
+var mentionRegex = regexp.MustCompile(`@(\d+)`)
+
+// extractMentionJIDs finds standalone @phone tokens in visible message text.
+func extractMentionJIDs(text string) []string {
+	matches := mentionRegex.FindAllStringSubmatchIndex(text, -1)
+	seen := make(map[string]bool)
+	var jids []string
+	for _, m := range matches {
+		// Ignore candidates anywhere inside a URL token, including paths that
+		// put an opening parenthesis immediately before the @ sign.
+		tokenStart := 0
+		if space := strings.LastIndexFunc(text[:m[0]], unicode.IsSpace); space >= 0 {
+			_, size := utf8.DecodeRuneInString(text[space:])
+			tokenStart = space + size
+		}
+		tokenEnd := len(text)
+		if end := strings.IndexFunc(text[m[1]:], unicode.IsSpace); end >= 0 {
+			tokenEnd = m[1] + end
+		}
+		token := strings.ToLower(text[tokenStart:tokenEnd])
+		if strings.Contains(token, "://") || strings.Contains(token, "www.") || strings.Contains(token, "mailto:") {
+			continue
+		}
+		if m[0] > 0 {
+			previous, _ := utf8.DecodeLastRuneInString(text[:m[0]])
+			if !unicode.IsSpace(previous) && !strings.ContainsRune("([{,;!?\"'“‘", previous) {
+				continue
+			}
+		}
+		if m[1] < len(text) {
+			next, size := utf8.DecodeRuneInString(text[m[1]:])
+			if next == '.' {
+				// A sentence-ending period is allowed, but a domain suffix is not.
+				rest := text[m[1]+size:]
+				if rest != "" {
+					after, _ := utf8.DecodeRuneInString(rest)
+					if !unicode.IsSpace(after) && !strings.ContainsRune(")]}\"'”’", after) {
+						continue
+					}
+				}
+			} else if !unicode.IsSpace(next) && !strings.ContainsRune(")]},;!?\"'”’", next) {
+				continue
+			}
+		}
+		jid := text[m[2]:m[3]] + "@s.whatsapp.net"
+		if !seen[jid] {
+			seen[jid] = true
+			jids = append(jids, jid)
+		}
+	}
+	return jids
+}
+
+// mergeMentionJIDs combines explicitly provided MentionedJID entries with
+// @phone mentions auto-detected from the message text, deduplicated.
+func mergeMentionJIDs(explicit []string, text string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, jid := range explicit {
+		if !seen[jid] {
+			seen[jid] = true
+			out = append(out, jid)
+		}
+	}
+	for _, jid := range extractMentionJIDs(text) {
+		if !seen[jid] {
+			seen[jid] = true
+			out = append(out, jid)
+		}
+	}
+	return out
+}
+
 func Find(slice []string, val string) bool {
 	for _, item := range slice {
 		if item == val {
@@ -146,6 +248,15 @@ func fetchURLBytes(ctx context.Context, resourceURL string, limit int64) ([]byte
 	if err != nil {
 		return nil, "", err
 	}
+
+	// Sites with bot protection (e.g. Mercado Livre) return 403 to Go's
+	// default "Go-http-client" agent; WhatsApp's own preview fetcher UA is
+	// widely allowed since sites want their links previewed in WhatsApp.
+	req.Header.Set("User-Agent", "WhatsApp/2.23.20.0")
+	// Do not advertise image/avif: CDNs then serve AVIF, which Go's image
+	// package cannot decode (gif/png/jpeg/webp decoders are registered).
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "pt-BR,pt;q=0.9,en;q=0.8")
 
 	resp, err := globalHTTPClient.Do(req)
 	if err != nil {
@@ -174,12 +285,12 @@ func fetchURLBytes(ctx context.Context, resourceURL string, limit int64) ([]byte
 	return data, contentType, nil
 }
 
-func getOpenGraphData(ctx context.Context, urlStr string, userID string) (title, description string, imageData []byte) {
+func getOpenGraphData(ctx context.Context, urlStr string, userID string) openGraphResult {
 	// Check cache first
 	if cachedData, found := openGraphCache.Get(urlStr); found {
 		if data, ok := cachedData.(openGraphResult); ok {
 			log.Debug().Str("url", urlStr).Msg("Open Graph data fetched from cache")
-			return data.Title, data.Description, data.ImageData
+			return data
 		}
 	}
 
@@ -211,30 +322,29 @@ func getOpenGraphData(ctx context.Context, urlStr string, userID string) (title,
 		}()
 
 		// Fetch Open Graph data
-		title, description, imageData := fetchOpenGraphData(ctx, urlStr)
+		result := fetchOpenGraphData(ctx, urlStr)
 
 		// Store in cache
-		openGraphCache.Set(urlStr, openGraphResult{title, description, imageData}, cache.DefaultExpiration)
+		openGraphCache.Set(urlStr, result, cache.DefaultExpiration)
 
-		return openGraphResult{title, description, imageData}, nil
+		return result, nil
 	})
 
 	if err != nil {
 		log.Error().Err(err).Str("url", urlStr).Msg("Error fetching Open Graph data via singleflight")
-		return "", "", nil
+		return openGraphResult{}
 	}
 
 	if v == nil {
-		return "", "", nil
+		return openGraphResult{}
 	}
 
-	data := v.(openGraphResult)
-	return data.Title, data.Description, data.ImageData
+	return v.(openGraphResult)
 }
 
 // Update entry in User map
 func updateUserInfo(values interface{}, field string, value string) interface{} {
-	log.Debug().Str("field", field).Str("value", value).Msg("User info updated")
+	log.Debug().Str("field", field).Msg("User info updated")
 	// Copy-on-write: the map inside Values is shared — it lives in
 	// userinfocache and is handed to request goroutines via the request
 	// context. Mutating it in place races with concurrent readers (Values.Get)
@@ -258,11 +368,16 @@ func callHook(myurl string, payload map[string]string, userID string) {
 
 // webhook for regular messages with HMAC
 func callHookWithHmac(myurl string, payload map[string]string, userID string, encryptedHmacKey []byte) {
-	log.Info().Str("url", myurl).Str("userID", userID).Msg("Sending POST to client with retry logic")
+	postHookWithHmac(clientManager.GetHTTPClient(userID), myurl, payload, userID, encryptedHmacKey)
+}
 
-	client := clientManager.GetHTTPClient(userID)
+// postHookWithHmac delivers with the client the caller looked up, so a delivery
+// queued just before its session stops still has one.
+func postHookWithHmac(client *resty.Client, myurl string, payload map[string]string, userID string, encryptedHmacKey []byte) {
+	log.Info().Str("userID", userID).Msg("Sending POST to client with retry logic")
+
 	if client == nil {
-		log.Warn().Str("url", myurl).Str("userID", userID).Msg("HTTP client is nil for user, skipping webhook")
+		log.Warn().Str("userID", userID).Msg("HTTP client is nil for user, skipping webhook")
 		return
 	}
 
@@ -286,7 +401,6 @@ func callHookWithHmac(myurl string, payload map[string]string, userID string, en
 
 			log.Warn().
 				Int("attempt", attempt+1).
-				Str("url", myurl).
 				Dur("delay", delayDuration).
 				Msg("Retrying webhook request with exponential backoff...")
 
@@ -358,7 +472,7 @@ func callHookWithHmac(myurl string, payload map[string]string, userID string, en
 		lastError = postErr
 
 		if postErr != nil {
-			log.Error().Err(postErr).Int("attempt", attempt+1).Str("url", myurl).Msg("Webhook failed due to network/IO error")
+			log.Error().Str("error_type", fmt.Sprintf("%T", postErr)).Int("attempt", attempt+1).Msg("Webhook failed due to network/IO error")
 			continue
 		}
 
@@ -367,7 +481,6 @@ func callHookWithHmac(myurl string, payload map[string]string, userID string, en
 			log.Error().
 				Int("status", resp.StatusCode()).
 				Int("attempt", attempt+1).
-				Str("url", myurl).
 				Msg("Webhook failed due to non-2xx status code")
 
 			if !*webhookRetryEnabled {
@@ -376,12 +489,12 @@ func callHookWithHmac(myurl string, payload map[string]string, userID string, en
 			continue
 		}
 
-		log.Info().Int("status", resp.StatusCode()).Str("url", myurl).Msg("Webhook call successful")
+		log.Info().Int("status", resp.StatusCode()).Msg("Webhook call successful")
 		return
 	}
 
 	if lastError != nil {
-		log.Error().Str("url", myurl).Msg("Webhook permanently failed after all retries. Sending to error queue...")
+		log.Error().Msg("Webhook permanently failed after all retries. Sending to error queue...")
 
 		errorPayloadMap := make(map[string]interface{})
 		if p, ok := body.(map[string]string); ok {
@@ -414,11 +527,11 @@ func callHookFile(myurl string, payload map[string]string, userID string, file s
 
 // webhook for messages with file attachments and HMAC
 func callHookFileWithHmac(myurl string, payload map[string]string, userID string, file string, encryptedHmacKey []byte) error {
-	log.Info().Str("file", file).Str("url", myurl).Msg("Sending POST with retry logic")
+	log.Info().Str("file", file).Msg("Sending POST with retry logic")
 
 	client := clientManager.GetHTTPClient(userID)
 	if client == nil {
-		log.Warn().Str("url", myurl).Str("userID", userID).Msg("HTTP client is nil for user, skipping file webhook")
+		log.Warn().Str("userID", userID).Msg("HTTP client is nil for user, skipping file webhook")
 		return fmt.Errorf("http client is nil for user %s", userID)
 	}
 
@@ -444,7 +557,6 @@ func callHookFileWithHmac(myurl string, payload map[string]string, userID string
 
 			log.Warn().
 				Int("attempt", attempt+1).
-				Str("url", myurl).
 				Dur("delay", delayDuration).
 				Msg("Retrying file webhook request with exponential backoff...")
 
@@ -482,7 +594,7 @@ func callHookFileWithHmac(myurl string, payload map[string]string, userID string
 		lastError = postErr
 
 		if postErr != nil {
-			log.Error().Err(postErr).Int("attempt", attempt+1).Str("url", myurl).Msg("File webhook failed due to network/IO error")
+			log.Error().Str("error_type", fmt.Sprintf("%T", postErr)).Int("attempt", attempt+1).Msg("File webhook failed due to network/IO error")
 			continue
 		}
 
@@ -491,7 +603,6 @@ func callHookFileWithHmac(myurl string, payload map[string]string, userID string
 			log.Error().
 				Int("status", resp.StatusCode()).
 				Int("attempt", attempt+1).
-				Str("url", myurl).
 				Msg("File webhook failed due to non-2xx status code")
 
 			if !*webhookRetryEnabled {
@@ -500,12 +611,12 @@ func callHookFileWithHmac(myurl string, payload map[string]string, userID string
 			continue
 		}
 
-		log.Info().Int("status", resp.StatusCode()).Str("url", myurl).Msg("File webhook call successful")
+		log.Info().Int("status", resp.StatusCode()).Msg("File webhook call successful")
 		return nil
 	}
 
 	if lastError != nil {
-		log.Error().Str("url", myurl).Msg("File webhook permanently failed after all retries. Sending to error queue...")
+		log.Error().Msg("File webhook permanently failed after all retries. Sending to error queue...")
 
 		errorPayloadMap := make(map[string]interface{})
 		for k, v := range finalPayload {
@@ -667,17 +778,17 @@ func extractFirstURL(text string) string {
 
 	return match
 }
-func fetchOpenGraphData(ctx context.Context, urlStr string) (string, string, []byte) {
+func fetchOpenGraphData(ctx context.Context, urlStr string) openGraphResult {
 	pageData, _, err := fetchURLBytes(ctx, urlStr, openGraphPageMaxBytes)
 	if err != nil {
 		log.Warn().Err(err).Str("url", urlStr).Msg("Failed to fetch URL for Open Graph data")
-		return "", "", nil
+		return openGraphResult{}
 	}
 
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(pageData))
 	if err != nil {
 		log.Warn().Err(err).Str("url", urlStr).Msg("Failed to parse HTML for Open Graph data")
-		return "", "", nil
+		return openGraphResult{}
 	}
 
 	title := doc.Find(`meta[property="og:title"]`).AttrOr("content", "")
@@ -708,34 +819,51 @@ func fetchOpenGraphData(ctx context.Context, urlStr string) (string, string, []b
 		}
 	}
 
+	result := openGraphResult{Title: title, Description: description}
+
 	pageURL, err := url.Parse(urlStr)
 	if err != nil {
 		log.Warn().Err(err).Str("url", urlStr).Msg("Failed to parse page URL for resolving image URL")
-		return title, description, nil
+		return result
 	}
 
-	imageData := fetchOpenGraphImage(ctx, pageURL, imageURLStr)
-	return title, description, imageData
+	fetchOpenGraphImage(ctx, pageURL, imageURLStr, &result)
+	return result
 }
 
-func fetchOpenGraphImage(ctx context.Context, pageURL *url.URL, imageURLStr string) []byte {
+func encodeJPEGThumbnail(img image.Image) []byte {
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: openGraphJpegQuality}); err != nil {
+		log.Warn().Err(err).Msg("Failed to encode thumbnail to JPEG")
+		return nil
+	}
+	return buf.Bytes()
+}
+
+func fetchOpenGraphImage(ctx context.Context, pageURL *url.URL, imageURLStr string, result *openGraphResult) {
+	// No image found on the page; an empty string would resolve to the page
+	// URL itself and we would try to decode HTML as an image.
+	if imageURLStr == "" {
+		return
+	}
+
 	imageURL, err := url.Parse(imageURLStr)
 	if err != nil {
 		log.Warn().Err(err).Str("imageURL", imageURLStr).Msg("Failed to parse Open Graph image URL")
-		return nil
+		return
 	}
 
 	resolvedImageURL := pageURL.ResolveReference(imageURL).String()
 	imgBytes, _, err := fetchURLBytes(ctx, resolvedImageURL, openGraphImageMaxBytes)
 	if err != nil {
 		log.Warn().Err(err).Str("imageURL", resolvedImageURL).Msg("Failed to fetch Open Graph image")
-		return nil
+		return
 	}
 
 	imgConfig, _, err := image.DecodeConfig(bytes.NewReader(imgBytes))
 	if err != nil {
 		log.Warn().Err(err).Str("imageURL", resolvedImageURL).Msg("Failed to decode Open Graph image config")
-		return nil
+		return
 	}
 
 	if imgConfig.Width > openGraphMaxImageDim || imgConfig.Height > openGraphMaxImageDim {
@@ -744,152 +872,24 @@ func fetchOpenGraphImage(ctx context.Context, pageURL *url.URL, imageURLStr stri
 			Int("height", imgConfig.Height).
 			Str("imageURL", resolvedImageURL).
 			Msg("Open Graph image dimensions too large")
-		return nil
+		return
 	}
 
 	img, _, err := image.Decode(bytes.NewReader(imgBytes))
 	if err != nil {
 		log.Warn().Err(err).Str("imageURL", resolvedImageURL).Msg("Failed to decode Open Graph image")
-		return nil
+		return
 	}
 
-	thumbnail := resize.Thumbnail(openGraphThumbnailWidth, openGraphThumbnailHeight, img, resize.Lanczos3)
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, thumbnail, &jpeg.Options{Quality: openGraphJpegQuality}); err != nil {
-		log.Warn().Err(err).Msg("Failed to encode thumbnail to JPEG")
-		return nil
-	}
+	hqThumb := resize.Thumbnail(openGraphHQThumbnailDim, openGraphHQThumbnailDim, img, resize.Lanczos3)
+	result.HQImageData = encodeJPEGThumbnail(hqThumb)
+	bounds := hqThumb.Bounds()
+	result.HQWidth = uint32(bounds.Dx())
+	result.HQHeight = uint32(bounds.Dy())
 
-	return buf.Bytes()
-}
-
-func runFFmpegConversion(input []byte, inputExt string, ffmpegArgs func(inPath, outPath string) []string, errMsg string) ([]byte, error) {
-	inFile, err := os.CreateTemp("", "sticker-input-*"+inputExt)
-	if err != nil {
-		return nil, err
-	}
-	defer os.Remove(inFile.Name())
-	defer inFile.Close()
-
-	if _, err := inFile.Write(input); err != nil {
-		return nil, err
-	}
-
-	outFile, err := os.CreateTemp("", "sticker-output-*.webp")
-	if err != nil {
-		return nil, err
-	}
-	outPath := outFile.Name()
-	outFile.Close()
-	defer os.Remove(outPath)
-
-	args := ffmpegArgs(inFile.Name(), outPath)
-	cmd := exec.Command("ffmpeg", args...)
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		log.Error().Err(err).Str("stderr", stderr.String()).Msg(errMsg)
-		return nil, err
-	}
-
-	return os.ReadFile(outPath)
-}
-
-func convertVideoStickerToWebP(input []byte) ([]byte, error) {
-	return runFFmpegConversion(input, ".mp4", func(inPath, outPath string) []string {
-		return []string{
-			"-y",
-			"-t", "10",
-			"-i", inPath,
-			"-vf", "fps=15,scale=512:512",
-			"-loop", "0",
-			"-an",
-			"-vsync", "0",
-			"-fs", "1000000",
-			"-c:v", "libwebp",
-			"-qscale:v", "10",
-			outPath,
-		}
-	}, "ffmpeg failed converting video sticker")
-}
-
-func convertImageToWebP(input []byte) ([]byte, error) {
-	return runFFmpegConversion(input, ".img", func(inPath, outPath string) []string {
-		return []string{
-			"-y",
-			"-i", inPath,
-			"-vf", "scale=512:512",
-			"-c:v", "libwebp",
-			"-lossless", "1",
-			outPath,
-		}
-	}, "ffmpeg failed converting image sticker")
-}
-
-func processStickerData(stickerData string, mimeOverride string, packID, packName, packPublisher string, emojis []string) ([]byte, string, error) {
-	if !strings.HasPrefix(stickerData, "data") {
-		return nil, "", fmt.Errorf("data should start with \"data:mime/type;base64,\"")
-	}
-
-	dataURL, err := dataurl.DecodeString(stickerData)
-	if err != nil {
-		return nil, "", fmt.Errorf("could not decode base64 encoded data from payload")
-	}
-
-	filedata, mimeType, err := convertToWebPSticker(dataURL.Data, mimeOverride)
-	if err != nil {
-		return nil, "", err
-	}
-
-	if mimeType == "image/webp" {
-		filedata = embedStickerEXIF(filedata, packID, packName, packPublisher, emojis)
-	}
-
-	return filedata, mimeType, nil
-}
-
-func convertToWebPSticker(data []byte, mimeOverride string) ([]byte, string, error) {
-	mimeType := http.DetectContentType(data)
-	if mimeOverride != "" {
-		mimeType = mimeOverride
-	}
-
-	switch {
-	case strings.HasPrefix(mimeType, "video/"), mimeType == "image/gif":
-		converted, err := convertVideoStickerToWebP(data)
-		if err != nil {
-			return nil, "", fmt.Errorf("failed to convert video/gif sticker to webp: %w", err)
-		}
-		return converted, "image/webp", nil
-
-	case mimeType == "image/jpeg", mimeType == "image/png", mimeType == "image/jpg":
-		converted, err := convertImageToWebP(data)
-		if err != nil {
-			return nil, "", fmt.Errorf("failed to convert image sticker to webp: %w", err)
-		}
-		return converted, "image/webp", nil
-
-	default:
-		return data, mimeType, nil
-	}
-}
-
-func embedStickerEXIF(inputWebP []byte, packID, packName, packPublisher string, emojis []string) []byte {
-	meta := buildStickerMetadata(packID, packName, packPublisher, emojis)
-	if meta == nil {
-		return inputWebP
-	}
-
-	exifData := buildWhatsAppEXIF(meta)
-	out, err := injectWebPEXIF(inputWebP, exifData)
-	if err != nil {
-		log.Warn().Err(err).Msg("failed to inject EXIF chunk; sending sticker without metadata")
-		return inputWebP
-	}
-	return out
+	// Downscale the inline thumbnail from hqThumb (max 600px) instead of
+	// resizing the original image (up to 4000px) a second time.
+	result.ImageData = encodeJPEGThumbnail(resize.Thumbnail(openGraphThumbnailWidth, openGraphThumbnailHeight, hqThumb, resize.Lanczos3))
 }
 
 func buildStickerMetadata(packID, packName, packPublisher string, emojis []string) map[string]interface{} {
@@ -938,68 +938,10 @@ func buildWhatsAppEXIF(meta map[string]interface{}) []byte {
 	return buf.Bytes()
 }
 
-func injectWebPEXIF(in []byte, exif []byte) ([]byte, error) {
-	if !isValidWebP(in) {
-		return nil, fmt.Errorf("not a RIFF WEBP file")
-	}
-
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(in))
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode image config: %w", err)
-	}
-
-	chunks, vp8xIndex, err := parseWebPChunks(in)
-	if err != nil {
-		return nil, err
-	}
-
-	chunks = ensureVP8XWithEXIF(chunks, vp8xIndex, cfg.Width, cfg.Height)
-
-	return assembleWebP(chunks, exif), nil
-}
-
 func isValidWebP(data []byte) bool {
 	return len(data) >= riffHeaderSize &&
 		string(data[0:4]) == "RIFF" &&
 		string(data[8:12]) == "WEBP"
-}
-
-func parseWebPChunks(in []byte) (chunks [][]byte, vp8xIndex int, err error) {
-	vp8xIndex = -1
-	pos := riffHeaderSize
-
-	for pos+chunkHeaderSize <= len(in) {
-		tag := string(in[pos : pos+4])
-		size := int(binary.LittleEndian.Uint32(in[pos+4 : pos+8]))
-		dataEnd := pos + chunkHeaderSize + size
-
-		if dataEnd > len(in) {
-			return nil, -1, fmt.Errorf("truncated webp chunk: %s", tag)
-		}
-
-		pad := size & 1
-		if tag == "VP8X" && size >= vp8xPayloadSize {
-			vp8xIndex = len(chunks)
-		}
-		if tag != "EXIF" {
-			chunk := make([]byte, chunkHeaderSize+size+pad)
-			copy(chunk, in[pos:dataEnd])
-			if pad == 1 {
-				chunk[chunkHeaderSize+size] = 0
-			}
-			chunks = append(chunks, chunk)
-		}
-		pos = dataEnd + pad
-	}
-	return chunks, vp8xIndex, nil
-}
-
-func ensureVP8XWithEXIF(chunks [][]byte, vp8xIndex, width, height int) [][]byte {
-	if vp8xIndex >= 0 {
-		chunks[vp8xIndex][vp8xFlagsOffset] |= vp8xFlagEXIF
-		return chunks
-	}
-	return append([][]byte{createVP8XChunk(width, height)}, chunks...)
 }
 
 func createVP8XChunk(width, height int) []byte {
@@ -1016,23 +958,6 @@ func putUint24LE(b []byte, v int) {
 	b[0] = uint8(v)
 	b[1] = uint8(v >> 8)
 	b[2] = uint8(v >> 16)
-}
-
-func assembleWebP(chunks [][]byte, exif []byte) []byte {
-	var out bytes.Buffer
-	out.WriteString("RIFF")
-	out.Write([]byte{0, 0, 0, 0})
-	out.WriteString("WEBP")
-
-	for _, c := range chunks {
-		out.Write(c)
-	}
-
-	writeChunk(&out, "EXIF", exif)
-
-	b := out.Bytes()
-	binary.LittleEndian.PutUint32(b[riffSizeOffset:], uint32(len(b)-8))
-	return b
 }
 
 func writeChunk(buf *bytes.Buffer, tag string, data []byte) {
